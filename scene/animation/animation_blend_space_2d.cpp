@@ -36,6 +36,8 @@
 #include "core/object/class_db.h"
 #include "scene/animation/animation_blend_tree.h"
 
+const AnimationNodeBlendSpace2D::Issues AnimationNodeBlendSpace2D::issues;
+
 void AnimationNodeBlendSpace2D::get_parameter_list(LocalVector<PropertyInfo> *r_list) const {
 	AnimationNode::get_parameter_list(r_list);
 	r_list->push_back(PropertyInfo(Variant::VECTOR2, blend_position));
@@ -839,12 +841,22 @@ void AnimationNodeBlendSpace2D::_animation_node_removed(const ObjectID &p_oid, c
 	AnimationRootNode::_animation_node_removed(p_oid, p_node);
 }
 
-void AnimationNodeBlendSpace2D::validate_node(const AnimationTree *p_tree, const StringName &p_path) const {
-	AnimationRootNode::validate_node(p_tree, p_path);
+void AnimationNodeBlendSpace2D::prepare(AnimationTree *p_tree, const StringName &p_path) {
+	AnimationRootNode::prepare(p_tree, p_path);
 
-	const_cast<AnimationNodeBlendSpace2D *>(this)->_update_triangles();
+	this->_update_triangles();
 	if (get_triangle_count() == 0) {
-		add_validation_error(p_tree, p_path, RTR("No triangles exist, so blending cannot take place."));
+		issues.no_triangles.issue()
+				.at(p_path)
+				.severity(Issue::Severity::ERROR)
+				.add_to(p_tree);
+	}
+
+	if (is_contain_invalid_point) {
+		issues.contains_invalid_cyclic_point.issue()
+				.at(p_path)
+				.severity(Issue::Severity::ERROR)
+				.add_to(p_tree);
 	}
 }
 

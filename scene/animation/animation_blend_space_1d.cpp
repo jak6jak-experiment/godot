@@ -34,6 +34,8 @@
 #include "core/object/class_db.h"
 #include "scene/animation/animation_blend_tree.h"
 
+const AnimationNodeBlendSpace1D::Issues AnimationNodeBlendSpace1D::issues;
+
 void AnimationNodeBlendSpace1D::get_parameter_list(LocalVector<PropertyInfo> *r_list) const {
 	AnimationNode::get_parameter_list(r_list);
 	r_list->push_back(PropertyInfo(Variant::FLOAT, blend_position));
@@ -74,11 +76,21 @@ void AnimationNodeBlendSpace1D::_animation_node_removed(const ObjectID &p_oid, c
 	AnimationRootNode::_animation_node_removed(p_oid, p_node);
 }
 
-void AnimationNodeBlendSpace1D::validate_node(const AnimationTree *p_tree, const StringName &p_path) const {
-	AnimationRootNode::validate_node(p_tree, p_path);
+void AnimationNodeBlendSpace1D::prepare(AnimationTree *p_tree, const StringName &p_path) {
+	AnimationRootNode::prepare(p_tree, p_path);
 
 	if (get_blend_point_count() == 0) {
-		add_validation_error(p_tree, p_path, RTR("No blend points exist, so blending cannot take place."));
+		issues.no_blend_points.issue()
+				.at(p_path)
+				.severity(Issue::Severity::ERROR)
+				.add_to(p_tree);
+	}
+
+	if (is_contain_invalid_point) {
+		issues.contains_invalid_cyclic_point.issue()
+				.at(p_path)
+				.severity(Issue::Severity::ERROR)
+				.add_to(p_tree);
 	}
 }
 

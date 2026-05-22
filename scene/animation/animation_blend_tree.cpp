@@ -35,6 +35,8 @@
 #include "core/object/class_db.h"
 #include "scene/resources/animation.h"
 
+const AnimationNodeAnimation::Issues AnimationNodeAnimation::issues;
+
 void AnimationNodeAnimation::set_animation(const StringName &p_name) {
 	if (animation == p_name) {
 		return;
@@ -53,12 +55,22 @@ StringName AnimationNodeAnimation::get_animation() const {
 
 LocalVector<StringName> (*AnimationNodeAnimation::get_editable_animation_list)() = nullptr;
 
-void AnimationNodeAnimation::validate_node(const AnimationTree *p_tree, const StringName &p_path) const {
-	AnimationRootNode::validate_node(p_tree, p_path);
+void AnimationNodeAnimation::prepare(AnimationTree *p_tree, const StringName &p_path) {
+	AnimationRootNode::prepare(p_tree, p_path);
 
-	const Ref<Animation> &animation_resource = p_tree->get_animation_or_null(animation);
-	if (animation_resource.is_null()) {
-		add_validation_error(p_tree, p_path, vformat(RTR("Animation '%s' not found."), animation));
+	if (animation.is_empty()) {
+		issues.animation_not_set.issue()
+				.at(p_path)
+				.severity(Issue::Severity::WARNING)
+				.add_to(p_tree);
+	} else {
+		if (const Ref<Animation> &animation_resource = p_tree->get_animation_or_null(animation); animation_resource.is_null()) {
+			issues.animation_not_found.issue()
+					.at(p_path)
+					.severity(Issue::Severity::ERROR)
+					.args(animation)
+					.add_to(p_tree);
+		}
 	}
 }
 
@@ -102,8 +114,13 @@ void AnimationNodeAnimation::_validate_property(PropertyInfo &p_property) const 
 AnimationNode::NodeTimeInfo AnimationNodeAnimation::_process(ProcessState &p_process_state, AnimationNodeInstance &p_instance, const AnimationMixer::PlaybackInfo &p_playback_info, bool p_test_only) {
 	_update_animation_cache(p_process_state.tree, p_instance);
 	const Ref<Animation> &anim = p_instance.cached_animation;
-	// Should not ever happen due to validation earlier.
-	ERR_FAIL_COND_V(anim.is_null(), NodeTimeInfo());
+	if (unlikely(anim.is_null())) {
+		issues.animation_not_set.issue()
+				.at(p_instance.path)
+				.severity(Issue::Severity::ERROR)
+				.add_to(p_process_state);
+		return NodeTimeInfo();
+	}
 	double anim_size = anim->get_length();
 
 	double cur_len;
@@ -400,13 +417,7 @@ void AnimationNodeAnimation::_update_animation_cache(AnimationTree *p_tree, Anim
 		return;
 	}
 
-	const Ref<Animation> &anim = p_tree->get_animation_or_null(animation);
-	if (anim.is_null()) {
-		// I don't think this can even occur with validation now.
-		return;
-	}
-
-	p_instance.cached_animation = anim;
+	p_instance.cached_animation = p_tree->get_animation_or_null(animation);
 	p_instance.cached_animation_version = animation_version;
 }
 
@@ -1828,33 +1839,44 @@ void AnimationNodeBlendTree::reset_state() {
 	emit_signal(SNAME("tree_changed"));
 }
 
-void AnimationNodeBlendTree::validate_node(const AnimationTree *p_tree, const StringName &p_path) const {
-	AnimationRootNode::validate_node(p_tree, p_path);
+void AnimationNodeBlendTree::prepare(AnimationTree *p_tree, const StringName &p_path) {
+	AnimationNode::prepare(p_tree, p_path);
+	AnimationNodeInstance &bt = p_tree->get_node_instance_by_path(p_path);
 
-	// Validate output connection.
-	{
-		const LocalVector<StringName> *output_connections = get_node_connection_array(SceneStringName(output));
-		const StringName &node_name = output_connections->operator[](0);
+	LocalVector<Pair<const StringName *, const Node *>> stack;
+	const StringName &output_name = SceneStringName(output);
+	const Node *output_node = nodes.getptr(output_name);
+	CRASH_COND(output_node == nullptr);
+	stack.push_back(Pair<const StringName *, const Node *>(&output_name, output_node));
 
-		if (const Node *child_node = nodes.getptr(node_name); !child_node) {
-			add_validation_error(p_tree, String(p_path) + SceneStringName(output) + "/", RTR("Nothing connected to output."));
-		}
-	}
+	while (!stack.is_empty()) {
+		const Pair<const StringName *, const Node *> c = stack[stack.size() - 1];
+		stack.remove_at(stack.size() - 1);
 
-	// Rest of children.
-	for (const KeyValue<StringName, Node> &E : nodes) {
-		const Node &child = E.value;
+		const StringName &current_name = *c.first;
+		const Node &current = *c.second;
+		StringName current_path = String(p_path) + current_name + "/";
 
-		// Skip output node, already validated.
-		if (E.key == SceneStringName(output)) {
-			continue;
-		}
+		CRASH_COND(current.node.is_null());
+		current.node->prepare(p_tree, current_path);
 
-		for (uint32_t input = 0; input < child.connections.size(); input++) {
-			const StringName &connected_node_name = child.connections[input];
-			if (const Node *connected_to = nodes.getptr(connected_node_name); !connected_to) {
-				StringName path = String(p_path) + String(E.key) + "/";
-				add_validation_error(p_tree, path, "Nothing connected to", input);
+		AnimationNodeInstance &instance = bt.get_child_instance_by_path(current_name);
+		instance.connection_instances.clear();
+		instance.connection_instances.resize(current.connections.size());
+		for (uint32_t input = 0; input < current.connections.size(); input++) {
+			const StringName &connected_node_name = current.connections[input];
+			const Node *connected_node = nodes.getptr(connected_node_name);
+
+			if (!connected_node) {
+				instance.connection_instances[input] = nullptr;
+				issues.missing_input_connection.issue()
+						.at(current_path)
+						.input(input)
+						.severity(Issue::Severity::WARNING)
+						.add_to(p_tree);
+			} else {
+				instance.connection_instances[input] = &bt.get_child_instance_by_path(connected_node_name);
+				stack.push_back(Pair(&connected_node_name, connected_node));
 			}
 		}
 	}

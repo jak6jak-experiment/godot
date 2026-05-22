@@ -35,6 +35,17 @@
 class AnimationNodeBlendSpace1D : public AnimationRootNode {
 	GDCLASS(AnimationNodeBlendSpace1D, AnimationRootNode);
 
+	struct Issues {
+		Issue::Descriptor no_blend_points = {
+			/*.id =*/ "no_blend_points",
+			/*.message_format =*/ "No blend points exist, so blending cannot take place.",
+		};
+		Issue::Descriptor contains_invalid_cyclic_point = {
+			/*.id =*/ "contains_invalid_cyclic_point",
+			/*.message_format =*/ "Cyclic sync modes require that all blend points in BlendSpace use non-nested Animation nodes with a finite, immutable length.",
+		};
+	} static const issues;
+
 public:
 	enum BlendMode {
 		BLEND_MODE_INTERPOLATED,
@@ -106,7 +117,7 @@ protected:
 #endif
 
 public:
-	virtual void validate_node(const AnimationTree *p_tree, const StringName &p_path) const override;
+	virtual void prepare(AnimationTree *p_tree, const StringName &p_path) override;
 
 	virtual void get_parameter_list(LocalVector<PropertyInfo> *r_list) const override;
 	virtual Variant get_parameter_default_value(const StringName &p_parameter) const override;

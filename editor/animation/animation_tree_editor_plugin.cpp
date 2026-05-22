@@ -108,12 +108,38 @@ void AnimationTreeEditor::_meta_clicked(Variant p_meta) {
 	}
 }
 
-void AnimationTreeEditor::_update_error_message(const String *p_other_errors) {
-	const String editor_error_message = tree->get_editor_error_message();
-	const AHashMap<StringName, AnimationNode::InvalidInstance> &invalid_instances = tree->get_invalid_instances();
+// RAII helper for RichTextLabel push/pop calls.
+struct RTLScope {
+	RichTextLabel *label;
 
-	static String last_error_key;
-	if (editor_error_message.is_empty() && invalid_instances.is_empty() && (!p_other_errors || p_other_errors->is_empty())) {
+	template <typename PushFunc>
+	RTLScope(RichTextLabel *p_label, PushFunc &&p_func) :
+			label(p_label) {
+		std::forward<PushFunc>(p_func)(label);
+	}
+
+	RTLScope(const RTLScope &) = delete;
+	RTLScope &operator=(const RTLScope &) = delete;
+
+	~RTLScope() {
+		label->pop();
+	}
+};
+
+#define CONCAT2(a, b) a##b
+#define CONCAT(a, b) CONCAT2(a, b)
+#define RTL(label, method, ...) \
+	RTLScope CONCAT(_rtl_, __LINE__) { \
+		label, [&](RichTextLabel *__p_label) { \
+			__p_label->method(__VA_ARGS__); \
+		} \
+	}
+
+void AnimationTreeEditor::_update_error_message(const String &p_other_errors) {
+	const String editor_error_message = tree->get_editor_error_message();
+	const AHashMap<StringName, AnimationNode::InvalidInstance> invalid_instances = tree->get_invalid_instances();
+
+	if (editor_error_message.is_empty() && invalid_instances.is_empty() && p_other_errors.is_empty()) {
 		last_error_key = String();
 		error_button->hide();
 		error_scroll->hide();
@@ -124,24 +150,7 @@ void AnimationTreeEditor::_update_error_message(const String *p_other_errors) {
 	// Cheaper to do this, than rebuild rich text label every frame.
 	// Though it would be better, to only call this when the tree changes.
 	{
-		StringBuffer k;
-		k += get_base_path();
-		k += editor_error_message;
-		if (p_other_errors) {
-			k += *p_other_errors;
-		}
-		for (const KeyValue<StringName, AnimationNode::InvalidInstance> &kv : invalid_instances) {
-			k += kv.key;
-			for (const String &reason : kv.value.errors) {
-				k += reason;
-			}
-			for (const AnimationNode::InvalidInstance::InputError &E : kv.value.input_errors) {
-				k += itos(E.index);
-				k += E.error;
-			}
-		}
-
-		String error_key = k.as_string();
+		String error_key = _create_cache_key(invalid_instances, p_other_errors, editor_error_message);
 		if (error_key == last_error_key) {
 			return;
 		}
@@ -165,29 +174,35 @@ void AnimationTreeEditor::_update_error_message(const String *p_other_errors) {
 
 	error_label->clear();
 	int count = 0;
+	AnimationNode::Issue::Severity max_severity = AnimationNode::Issue::Severity::WARNING;
 	bool scope_error_found = false;
 	StringName fallback_key;
 	StringName downstream_key;
 
 	if (!editor_error_message.is_empty()) {
-		error_label->append_text(editor_error_message);
-		error_label->add_newline();
 		count++;
+		max_severity = AnimationNode::Issue::Severity::ERROR;
 	}
 
-	if (p_other_errors) {
-		error_label->append_text(*p_other_errors);
+	if (!p_other_errors.is_empty()) {
+		error_label->append_text(p_other_errors);
 		error_label->add_newline();
 		count++;
-
+		max_severity = AnimationNode::Issue::Severity::ERROR;
 		scope_error_found = true;
 	}
 
-	error_label->push_table(2);
+	error_label->push_table(1);
 	for (const KeyValue<StringName, AnimationNode::InvalidInstance> &kv : invalid_instances) {
 		Ref<AnimationNode> node = tree->get_animation_node_by_path(kv.key);
 		ERR_CONTINUE(node.is_null());
-		count++;
+		count += kv.value.get_issue_count();
+		for (const AnimationNode::Issue &issue : kv.value.issues) {
+			if (issue.get_severity() == AnimationNode::Issue::Severity::ERROR) {
+				max_severity = AnimationNode::Issue::Severity::ERROR;
+				break;
+			}
+		}
 		if (!scope_error_found && current_node.is_valid()) {
 			if (fallback_key.is_empty()) {
 				fallback_key = kv.key;
@@ -215,66 +230,133 @@ void AnimationTreeEditor::_update_error_message(const String *p_other_errors) {
 			}
 		}
 
-		error_label->push_cell();
-		error_label->push_color(error_label->get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
-		error_label->append_text(vformat(RTR("%s at "), node->get_class()));
-		error_label->push_meta(String(kv.key));
-		error_label->append_text(vformat(RTR("'%s':"), kv.key));
-		error_label->pop(); // Meta.
-		error_label->pop(); // Color.
-		error_label->pop(); // Cell.
-
-		error_label->push_cell();
-		error_label->push_color(error_label->get_theme_color(SceneStringName(font_color), EditorStringName(Editor)));
-		for (const String &reason : kv.value.errors) {
-			error_label->append_text(reason);
-			error_label->add_newline();
-		}
-
-		const String input_error_base = String(kv.key) + "::";
-		for (const AnimationNode::InvalidInstance::InputError &input_error : kv.value.input_errors) {
-			const String input_name = node->get_input_name(input_error.index);
-			error_label->append_text(input_error.error + " ");
-			error_label->push_meta(input_error_base + itos(input_error.index));
-			error_label->append_text(vformat(RTR("input %d '%s'."), input_error.index, input_name));
-			error_label->pop(); // Meta.
-			error_label->append_text(" ");
-		}
-		error_label->pop(); // Color.
-		error_label->pop(); // Cell.
+		_draw_node_issues(kv, node);
 	}
 	error_label->pop(); // Table.
 
 	current_scope_error_label->clear();
-	if (p_other_errors) {
-		current_scope_error_label->push_color(current_scope_error_label->get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
-		current_scope_error_label->append_text(TTR("Error: ") + *p_other_errors);
-		current_scope_error_label->pop(); // Color.
+	if (!editor_error_message.is_empty()) {
+		RTL(current_scope_error_label, push_color, styles.error_color);
+		current_scope_error_label->append_text(editor_error_message);
+	} else if (!p_other_errors.is_empty()) {
+		RTL(current_scope_error_label, push_color, styles.error_color);
+		current_scope_error_label->append_text(TTR("Error: ") + p_other_errors);
 	} else {
 		const StringName display_key = scope_error_found ? fallback_key : (!downstream_key.is_empty() ? downstream_key : fallback_key);
 		if (!display_key.is_empty()) {
 			const AnimationNode::InvalidInstance &inst = invalid_instances.get(display_key);
 			Ref<AnimationNode> node = tree->get_animation_node_by_path(display_key);
-			const String input_error_base = String(display_key) + "::";
-			current_scope_error_label->push_color(current_scope_error_label->get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
-			current_scope_error_label->append_text(TTR("Error: "));
-			if (!inst.errors.is_empty()) {
-				current_scope_error_label->push_meta(String(display_key));
-				current_scope_error_label->append_text(inst.errors[0]);
-				current_scope_error_label->pop(); // Meta.
-			} else if (!inst.input_errors.is_empty() && node.is_valid()) {
-				current_scope_error_label->push_meta(input_error_base + itos(inst.input_errors[0].index));
-				current_scope_error_label->append_text(inst.input_errors[0].error + " ");
-				current_scope_error_label->append_text(vformat(RTR("input %d '%s'."), inst.input_errors[0].index, node->get_input_name(inst.input_errors[0].index)));
-				current_scope_error_label->pop(); // Meta.
+			if (!inst.issues.is_empty()) {
+				_draw_compact_node_issue(current_scope_error_label, String(display_key), inst.issues[0], node);
 			}
-			current_scope_error_label->pop(); // Color.
 		}
 	}
 
-	error_button->set_text(itos(count));
+	error_button->set_button_icon(styles.get_issue_icon(max_severity));
+	error_button->add_theme_color_override(SceneStringName(font_color), styles.get_issue_color(max_severity));
+	error_button->set_text(_format_issue_count(count));
 	error_button->show();
 }
+
+String AnimationTreeEditor::_create_cache_key(const AHashMap<StringName, AnimationNode::InvalidInstance> &p_invalid_instances, const String &p_other_errors, const String &p_editor_error_message) {
+	StringBuffer k;
+	k += get_base_path();
+	k += p_editor_error_message;
+	if (!p_other_errors.is_empty()) {
+		k += p_other_errors;
+	}
+	for (const KeyValue<StringName, AnimationNode::InvalidInstance> &kv : p_invalid_instances) {
+		k += kv.key;
+		for (const AnimationNode::Issue &issue : kv.value.issues) {
+			k += issue.get_descriptor()->id;
+			k += itos(static_cast<int>(issue.get_severity()));
+			k += itos(issue.get_location().get_input_index());
+			k += itos(issue.get_message_arguments().size());
+			for (const Variant &arg : issue.get_message_arguments()) {
+				k += String(arg);
+			}
+		}
+	}
+
+	return k.as_string();
+}
+
+String AnimationTreeEditor::_format_issue_count(int p_count) const {
+	return vformat(TTRN("%d Issue", "%d Issues", p_count), p_count);
+}
+
+AnimationTreeEditor::Styles AnimationTreeEditor::Styles::load(const Control &control) {
+	return {
+		.error_icon = (control.get_editor_theme_icon(SNAME("StatusError"))),
+		.warning_icon = (control.get_editor_theme_icon(SNAME("NodeWarning"))),
+		.error_color = (control.get_theme_color(SNAME("error_color"), EditorStringName(Editor))),
+		.warning_color = (control.get_theme_color(SNAME("warning_color"), EditorStringName(Editor))),
+		.primary_text_color = (control.get_theme_color(SNAME("font_color"), EditorStringName(Editor))),
+		.secondary_text_color = (control.get_theme_color(SNAME("font_disabled_color"), EditorStringName(Editor)))
+	};
+}
+
+void AnimationTreeEditor::_draw_node_issues(const KeyValue<StringName, AnimationNode::InvalidInstance> &p_instance, const Ref<AnimationNode> &p_node) const {
+	RTL(error_label, push_cell);
+
+	// Header for the affected node.
+	error_label->add_image(EditorNode::get_singleton()->get_class_icon(p_node->get_class(), "Object"));
+	{
+		RTL(error_label, push_color, styles.primary_text_color);
+		error_label->append_text(vformat(RTR(" %s at "), p_node->get_class()));
+		{
+			RTL(error_label, push_meta, String(p_instance.key));
+			error_label->append_text(vformat(RTR("'%s'"), p_instance.key));
+		}
+		{
+			RTL(error_label, push_color, styles.secondary_text_color);
+			error_label->append_text(" (" + _format_issue_count(p_instance.value.get_issue_count()) + ")");
+		}
+	}
+	error_label->add_newline();
+
+	const String input_error_base = String(p_instance.key) + "::";
+	for (const AnimationNode::Issue &issue : p_instance.value.issues) {
+		_draw_node_issue(error_label, input_error_base, issue, p_node);
+	}
+}
+
+void AnimationTreeEditor::_draw_node_issue(RichTextLabel *p_label, const String &p_input_error_base, const AnimationNode::Issue &p_issue, const Ref<AnimationNode> &p_node) const {
+	RTL(p_label, push_color, styles.get_issue_color(p_issue.get_severity()));
+	p_label->append_text("\t");
+	p_label->add_image(styles.get_issue_icon(p_issue.get_severity()));
+
+	String formatted_message = p_issue.create_formatted_message();
+	p_label->append_text(" " + formatted_message + " ");
+	_draw_node_issue_input(p_label, p_input_error_base, p_issue, p_node);
+	p_label->add_newline();
+}
+
+void AnimationTreeEditor::_draw_compact_node_issue(RichTextLabel *p_label, const String &p_node_meta, const AnimationNode::Issue &p_issue, const Ref<AnimationNode> &p_node) const {
+	RTL(p_label, push_color, styles.get_issue_color(p_issue.get_severity()));
+	{
+		RTL(p_label, push_meta, p_node_meta);
+		p_label->append_text(p_issue.get_severity() == AnimationNode::Issue::Severity::ERROR ? TTR("Error: ") : TTR("Warning: "));
+	}
+
+	String formatted_message = p_issue.create_formatted_message();
+	RTL(p_label, push_meta, p_node_meta);
+	p_label->append_text(formatted_message + " ");
+	const String input_error_base = String(p_node_meta) + "::";
+	_draw_node_issue_input(p_label, input_error_base, p_issue, p_node);
+}
+
+void AnimationTreeEditor::_draw_node_issue_input(RichTextLabel *p_label, const String &p_input_error_base, const AnimationNode::Issue &p_issue, const Ref<AnimationNode> &p_node) const {
+	if (p_issue.get_location().has_input_index() && p_node.is_valid()) {
+		int index = p_issue.get_location().get_input_index();
+		RTL(p_label, push_meta, p_input_error_base + itos(index));
+		p_label->append_text(vformat(RTR("input %d '%s'."), index, p_node->get_input_name(index)));
+	}
+}
+
+#undef RTL
+#undef CONCAT
+#undef CONCAT2
 
 void AnimationTreeEditor::edit(AnimationTree *p_tree) {
 	if (p_tree && !p_tree->is_connected("animation_list_changed", callable_mp(this, &AnimationTreeEditor::_animation_list_changed))) {
@@ -391,7 +473,7 @@ void AnimationTreeEditor::edit_path(const Vector<String> &p_path) {
 	}
 
 	_update_path();
-	_update_error_message(current_playback_error.is_empty() ? nullptr : &current_playback_error);
+	_update_error_message(current_playback_error);
 }
 
 void AnimationTreeEditor::_clear_editors() {
@@ -418,16 +500,17 @@ void AnimationTreeEditor::enter_editor(const String &p_path) {
 void AnimationTreeEditor::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_THEME_CHANGED: {
+			styles = Styles::load(*this);
 			Ref<StyleBoxEmpty> empty_style;
 			empty_style.instantiate();
 			error_scroll->add_theme_style_override(SceneStringName(panel), empty_style);
-			error_label->add_theme_color_override(SNAME("default_color"), get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
-			error_button->set_button_icon(get_editor_theme_icon(SNAME("StatusError")));
-			error_button->add_theme_color_override(SceneStringName(font_color), get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
+			error_label->add_theme_color_override(SNAME("default_color"), styles.error_color);
 			current_scope_error_label->add_theme_font_override(SNAME("normal_font"), get_theme_font(SNAME("main"), EditorStringName(EditorFonts)));
 			current_scope_error_label->add_theme_font_size_override(SNAME("normal_font_size"), get_theme_font_size(SNAME("main_size"), EditorStringName(EditorFonts)));
-			current_scope_error_label->add_theme_color_override(SNAME("default_color"), get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
+			current_scope_error_label->add_theme_color_override(SNAME("default_color"), styles.error_color);
 			current_scope_error_label->add_theme_style_override(SNAME("normal"), get_theme_stylebox(SNAME("normal"), SNAME("Label")));
+			// Force refresh of error messages to update icons and colors.
+			last_error_key = String();
 		} break;
 
 		case NOTIFICATION_PROCESS: {
@@ -445,7 +528,7 @@ void AnimationTreeEditor::_notification(int p_what) {
 			}
 
 			if (tree) {
-				_update_error_message(current_playback_error.is_empty() ? nullptr : &current_playback_error);
+				_update_error_message(current_playback_error);
 			}
 		} break;
 
@@ -567,7 +650,7 @@ AnimationTreeEditor::AnimationTreeEditor() {
 	error_button->set_default_cursor_shape(CURSOR_POINTING_HAND);
 	error_button->hide();
 	error_button->connect(SceneStringName(pressed), callable_mp(this, &AnimationTreeEditor::_toggle_error_panel));
-	error_button->set_tooltip_text(TTRC("Errors"));
+	error_button->set_tooltip_text(TTRC("Issues"));
 	status_bar->add_child(error_button);
 
 	add_plugin(memnew(AnimationNodeBlendTreeEditor));

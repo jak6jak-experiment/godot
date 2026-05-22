@@ -49,13 +49,24 @@ class AnimationNodeAnimation : public AnimationRootNode {
 	bool stretch_time_scale = true;
 	double start_offset = 0.0;
 
+	struct Issues {
+		Issue::Descriptor animation_not_set = {
+			/*.id =*/ "animation_not_set",
+			/*.message_format =*/ "Animation not set",
+		};
+		Issue::Descriptor animation_not_found = {
+			/*.id =*/ "animation_not_found",
+			/*.message_format =*/ "Animation '%s' not found.",
+		};
+	} static const issues;
+
 public:
 	enum PlayMode {
 		PLAY_MODE_FORWARD,
 		PLAY_MODE_BACKWARD
 	};
 
-	virtual void validate_node(const AnimationTree *p_tree, const StringName &p_path) const override;
+	virtual void prepare(AnimationTree *p_tree, const StringName &p_path) override;
 
 	void get_parameter_list(LocalVector<PropertyInfo> *r_list) const override;
 	virtual Variant get_parameter_default_value(const StringName &p_parameter) const override;
@@ -444,7 +455,7 @@ public:
 		//no need to check for cycles due to tree topology
 	};
 
-	virtual void validate_node(const AnimationTree *p_tree, const StringName &p_path) const override;
+	virtual void prepare(AnimationTree *p_tree, const StringName &p_path) override;
 
 	void add_node(const StringName &p_name, const Ref<AnimationNode> &p_node, const Vector2 &p_position = Vector2());
 	Ref<AnimationNode> get_node(const StringName &p_name) const;
